@@ -1,0 +1,6 @@
+@PertCPMBot_HostAddress = http://localhost:5186
+
+GET {{PertCPMBot_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
