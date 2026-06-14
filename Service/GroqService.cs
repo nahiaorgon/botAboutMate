@@ -16,6 +16,14 @@ public class GroqService
     private readonly ILogger<GroqService> _logger;
     IConfiguration _config;
 
+    private static readonly string[] FallbackModels =
+    [
+        "llama-3.3-70b-versatile",
+        "qwen-qwq-32b",
+        "llama-3.1-70b-versatile",
+        "mixtral-8x7b-32768"
+    ];
+
     private const string SYSTEM_PROMPT = @"
         Sos un chatbot asistente para gestores de proyectos especializado en PERT y CPM.
     Respondé SIEMPRE en español. Usá solo texto plano y emojis. Nunca uses HTML.
@@ -77,7 +85,9 @@ public class GroqService
     *Tiempos:* 1,3,5 | 2,4,8 | ...'
     Calculá internamente te=(O+4M+P)/6 para cada una.
 
-    Validación: si algún valor es no numérico o negativo → '❌ Valor inválido en posición [N]. Reingresá la línea completa.' y repetí el pedido.
+    Validación:
+    - Si algún valor es no numérico o negativo → '❌ Valor inválido en posición [N]. Reingresá la línea completa.' y repetí el pedido.
+    - Si para alguna actividad NO se cumple O ≤ M ≤ P → NO reordenés los valores ni calculés. Respondé: '❌ Error en actividad [N]: el optimista debe ser ≤ al más probable y éste ≤ al pesimista (O ≤ M ≤ P). Reingresá los tiempos completos.' y repetí el pedido del PASO 3.
 
     PASO 4 — Pedir precedencias:
     '🔗 Ingresá las precedencias con formato HIJO.PADRE separadas por comas.
@@ -136,11 +146,18 @@ public class GroqService
     4️⃣ Ir al inicio
     5️⃣ Salir'
 
-    - Cronograma → tabla de actividades ordenadas por ES con tiempos y ruta crítica marcada. Volvé al menú de resultados.
-    - Interpretar → explicá ES/EF, LS/LF, holgura, ruta crítica y duración total de forma breve. Volvé al menú de resultados.
-    - Programación lineal (solo CPM) → formulá el modelo: variables=tiempos de inicio, objetivo=minimizar duración total, restricciones=precedencias y no negatividad. Aclará que no aplica a PERT. Volvé al menú de resultados.
-    - Ir al inicio → Menú Principal.
-    - Salir → '👋 ¡Hasta luego! Fue un placer ayudarte.' y no respondas más hasta un nuevo mensaje.";
+    Acciones para PERT (usá el número exacto de la opción):
+    - Opción 1 → Cronograma: tabla de actividades ordenadas por ES con tiempos y ruta crítica marcada. Volvé al menú de resultados PERT.
+    - Opción 2 → Interpretar: explicá ES/EF, LS/LF, holgura, ruta crítica y duración total de forma breve. Volvé al menú de resultados PERT.
+    - Opción 3 → Ir al inicio: Menú Principal.
+    - Opción 4 → Salir: '👋 ¡Hasta luego! Fue un placer ayudarte.' y no respondas más hasta un nuevo mensaje.
+
+    Acciones para CPM (usá el número exacto de la opción):
+    - Opción 1 → Cronograma: tabla de actividades ordenadas por ES con tiempos y ruta crítica marcada. Volvé al menú de resultados CPM.
+    - Opción 2 → Interpretar: explicá ES/EF, LS/LF, holgura, ruta crítica y duración total de forma breve. Volvé al menú de resultados CPM.
+    - Opción 3 → Modelo de programación lineal: formulá el modelo con los datos del proyecto. Variables xi = tiempo de inicio de actividad i. Objetivo: minimizar la duración total del proyecto. Restricciones: xi + di ≤ xj para cada precedencia i→j, y xi ≥ 0 para todas. Mostrá el modelo completo con los valores reales del proyecto. Volvé al menú de resultados CPM.
+    - Opción 4 → Ir al inicio: Menú Principal.
+    - Opción 5 → Salir: '👋 ¡Hasta luego! Fue un placer ayudarte.' y no respondas más hasta un nuevo mensaje.";
 
     public GroqService(IConfiguration config, ILogger<GroqService> logger)
     {
@@ -184,33 +201,55 @@ public class GroqService
                 messages.Add(new { role = h.Role, content = h.Content });
             }
 
-            // 3. Llamar a Groq (Llama 3)
-            var body = new
+            // 3. Llamar a Groq con fallback automático entre modelos
+            var modelQueue = new List<string>();
+            var primaryModel = _config["Groq:Model"] ?? FallbackModels[0];
+            modelQueue.Add(primaryModel);
+            foreach (var m in FallbackModels)
+                if (m != primaryModel) modelQueue.Add(m);
+
+            string reply = "";
+            foreach (var model in modelQueue)
             {
-                model = _config["Groq:Model"],
-                messages = messages,
-                temperature = 0.5 // Baja temperatura para cálculos más precisos -> 0.2 recomendado para PERT/CPM, pero 0.5 para respuestas más naturales
-            };
+                var body = new
+                {
+                    model,
+                    messages,
+                    temperature = 0.5
+                };
 
-            var json = JsonSerializer.Serialize(body);
-            var httpContent = new StringContent(json, Encoding.UTF8, "application/json");
+                var json = JsonSerializer.Serialize(body);
+                var httpContent = new StringContent(json, Encoding.UTF8, "application/json");
+                var response = await _http.PostAsync("https://api.groq.com/openai/v1/chat/completions", httpContent);
+                var responseBody = await response.Content.ReadAsStringAsync();
 
-            // La URL de Groq
-            var response = await _http.PostAsync("https://api.groq.com/openai/v1/chat/completions", httpContent);
-            var responseBody = await response.Content.ReadAsStringAsync();
+                if (response.IsSuccessStatusCode)
+                {
+                    using var doc = JsonDocument.Parse(responseBody);
+                    reply = doc.RootElement
+                        .GetProperty("choices")[0]
+                        .GetProperty("message")
+                        .GetProperty("content")
+                        .GetString() ?? "";
+                    if (model != primaryModel)
+                        _logger.LogWarning("Modelo principal agotado. Usando fallback: {Model}", model);
+                    break;
+                }
 
-            if (!response.IsSuccessStatusCode)
-            {
-                _logger.LogError("Error Groq: {Body}", responseBody);
+                // 429 = rate limit agotado → probar siguiente modelo
+                if ((int)response.StatusCode == 429)
+                {
+                    _logger.LogWarning("Rate limit en modelo {Model}, probando siguiente.", model);
+                    continue;
+                }
+
+                // Otro error → no reintentar
+                _logger.LogError("Error Groq [{Model}]: {Body}", model, responseBody);
                 return "Lo siento, el motor de cálculo está descansando. 😴";
             }
 
-            using var doc = JsonDocument.Parse(responseBody);
-            var reply = doc.RootElement
-                .GetProperty("choices")[0]
-                .GetProperty("message")
-                .GetProperty("content")
-                .GetString() ?? "";
+            if (string.IsNullOrEmpty(reply))
+                return "Lo siento, todos los modelos están descansando. 😴 Intentá en unos minutos.";
 
             // 4. Guardar respuesta en DB
             await db.InsertAsync(new ConversationHistory
