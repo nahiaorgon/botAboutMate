@@ -26,7 +26,7 @@ public class WhatsAppService
         var body = new
         {
             messaging_product = "whatsapp",
-            to = toPhone,
+            to = toPhone, //tengo que agregar el "15" en meta 
             type = "text",
             text = new { body = message }
         };
